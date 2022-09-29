@@ -22,11 +22,16 @@ import io.openmessaging.connector.api.component.task.sink.SinkTask;
 import io.openmessaging.connector.api.data.ConnectRecord;
 import io.openmessaging.connector.api.data.RecordConverter;
 import io.openmessaging.internal.DefaultKeyValue;
+import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.rocketmq.client.consumer.DefaultLitePullConsumer;
+import org.apache.rocketmq.client.exception.MQClientException;
+import org.apache.rocketmq.common.message.MessageQueue;
 import org.apache.rocketmq.connect.runtime.common.ConnectKeyValue;
 import org.apache.rocketmq.connect.runtime.config.ConnectorConfig;
 import org.apache.rocketmq.connect.runtime.config.SinkConnectorConfig;
@@ -80,17 +85,33 @@ public class WorkerSinkTaskTest {
     private TransformChain<ConnectRecord> transformChain;
     private RetryWithToleranceOperator retryWithToleranceOperator = new RetryWithToleranceOperator(1000, 1000, ToleranceType.ALL, new ErrorMetricsGroup(new ConnectorTaskId("connect", 1), new ConnectMetrics(new WorkerConfig())));
     private WorkerErrorRecordReporter workerErrorRecordReporter;
+
     private WrapperStatusListener wrapperStatusListener;
 
     private StateManagementService stateManagementService;
 
+    private ServerResponseMocker nameServerMocker;
+
+    private ServerResponseMocker brokerMocker;
+
+    private Set<MessageQueue> queues = new HashSet<>();
+
+    private static final String TEST_TOPIC = "TEST_TOPIC";
+
     @Before
-    public void before() {
-        connectKeyValue.put(SinkConnectorConfig.CONNECT_TOPICNAMES, "TEST_TOPIC");
+    public void before() throws MQClientException {
+        nameServerMocker = NameServerMocker.startByDefaultConf(9876, 10911);
+        brokerMocker = ServerResponseMocker.startServer(10911, "Hello".getBytes(StandardCharsets.UTF_8));
+        connectKeyValue.put(SinkConnectorConfig.CONNECT_TOPICNAMES, TEST_TOPIC);
+        connectKeyValue.put(SinkConnectorConfig.CONNECTOR_CLASS, "org.apache.rocketmq.connect.file.FileSinkConnector");
         keyValue.put(ConnectorConfig.TRANSFORMS, "testTransform");
         keyValue.put("transforms-testTransform-class", "org.apache.rocketmq.connect.runtime.connectorwrapper.TestTransform");
         transformChain = new TransformChain<>(keyValue, plugin);
         workerErrorRecordReporter = new WorkerErrorRecordReporter(retryWithToleranceOperator, recordConverter);
+
+        defaultLitePullConsumer.setConsumerGroup("TEST_CONSUMER_GROUP");
+        defaultLitePullConsumer.setNamesrvAddr("localhost:9876");
+
         workerSinkTask = new WorkerSinkTask(
                 connectConfig,
                 connectorTaskId,
@@ -109,11 +130,23 @@ public class WorkerSinkTaskTest {
                 new WrapperStatusListener(new StateManagementServiceImpl(), "workId"),
                 new ConnectMetrics(new WorkerConfig())
         );
+
+
+        MessageQueue messageQueue = new MessageQueue();
+        messageQueue.setTopic(TEST_TOPIC);
+        messageQueue.setQueueId(0);
+        messageQueue.setBrokerName("mockBrokerName");
+        queues.add(messageQueue);
+        defaultLitePullConsumer.assign(queues);
+        workerSinkTask.initializeAndStart();
     }
 
     @After
     public void after() {
+        workerSinkTask.close();
         executorService.shutdown();
+        brokerMocker.shutdown();
+        nameServerMocker.shutdown();
     }
 
     @Test
@@ -122,4 +155,37 @@ public class WorkerSinkTaskTest {
         TimeUnit.SECONDS.sleep(5);
         workerSinkTask.close();
     }
+
+    @Test
+    public void iterationTest() {
+        Assertions.assertThatCode(() ->  workerSinkTask.iteration()).doesNotThrowAnyException();
+    }
+
+    @Test
+    public void transitionToTest() {
+        Assertions.assertThatCode(() -> workerSinkTask.transitionTo(TargetState.STARTED)).doesNotThrowAnyException();
+    }
+
+    @Test
+    public void removeMetricsTest() {
+        Assertions.assertThatCode(() -> workerSinkTask.removeMetrics()).doesNotThrowAnyException();
+    }
+
+    @Test
+    public void removeAndCloseMessageQueueTest() {
+        Set<MessageQueue> queues = new HashSet<>();
+        MessageQueue messageQueue = new MessageQueue();
+        messageQueue.setTopic(TEST_TOPIC);
+        messageQueue.setQueueId(0);
+        messageQueue.setBrokerName("broker0");
+        queues.add(messageQueue);
+        Assertions.assertThatCode(() ->  workerSinkTask.removeAndCloseMessageQueue(TEST_TOPIC, queues)).doesNotThrowAnyException();
+    }
+
+    @Test
+    public void assignMessageQueueTest() {
+
+        Assertions.assertThatCode(() ->  workerSinkTask.assignMessageQueue(queues)).doesNotThrowAnyException();
+    }
+
 }

@@ -17,13 +17,23 @@
 
 package org.apache.rocketmq.connect.runtime.connectorwrapper;
 
+import com.google.common.collect.Lists;
 import io.openmessaging.KeyValue;
 import io.openmessaging.connector.api.component.task.source.SourceTask;
 import io.openmessaging.connector.api.data.ConnectRecord;
+import io.openmessaging.connector.api.data.Field;
 import io.openmessaging.connector.api.data.RecordConverter;
+import io.openmessaging.connector.api.data.RecordOffset;
+import io.openmessaging.connector.api.data.RecordPartition;
+import io.openmessaging.connector.api.data.Schema;
+import io.openmessaging.connector.api.data.SchemaBuilder;
 import io.openmessaging.internal.DefaultKeyValue;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
 import org.apache.rocketmq.client.exception.MQClientException;
 import org.apache.rocketmq.client.producer.DefaultMQProducer;
+import org.apache.rocketmq.common.message.Message;
 import org.apache.rocketmq.connect.runtime.common.ConnectKeyValue;
 import org.apache.rocketmq.connect.runtime.config.ConnectorConfig;
 import org.apache.rocketmq.connect.runtime.config.SourceConnectorConfig;
@@ -42,6 +52,7 @@ import org.apache.rocketmq.connect.runtime.stats.ConnectStatsService;
 import org.apache.rocketmq.connect.runtime.utils.ConnectorTaskId;
 import org.assertj.core.api.Assertions;
 import org.junit.After;
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -53,14 +64,15 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
-
+import org.omg.CORBA.TIMEOUT;
 
 @RunWith(MockitoJUnitRunner.class)
 public class WorkerSourceTaskTest {
 
     ExecutorService executorService = Executors.newSingleThreadScheduledExecutor();
     private WorkerSourceTask workerSourceTask;
-    private WorkerConfig connectConfig;
+
+    private WorkerConfig workerConfig;
     private ConnectorTaskId connectorTaskId = new ConnectorTaskId("testConnector", 1);
     private SourceTask sourceTask = new TestSourceTask();
     private ConnectKeyValue connectKeyValue = new ConnectKeyValue();
@@ -80,33 +92,137 @@ public class WorkerSourceTaskTest {
 
     private ServerResponseMocker brokerMocker;
 
+    private WorkerSourceTask.SourceTaskMetricsGroup sourceTaskMetricsGroup;
+
+    private ConnectMetrics connectMetrics;
+
+    private WorkerSourceTask.CalcSourceRecordWrite calcSourceRecordWrite;
+
     @Before
     public void before() throws MQClientException, InterruptedException {
-        connectConfig = new WorkerConfig();
-        connectConfig.setNamesrvAddr("127.0.0.1:9876");
-        connectStatsManager = new ConnectStatsManager(connectConfig);
+        workerConfig = new WorkerConfig();
+        workerConfig.setNamesrvAddr("127.0.0.1:9876");
+        connectStatsManager = new ConnectStatsManager(workerConfig);
         connectKeyValue.put(SourceConnectorConfig.CONNECT_TOPICNAME, "TEST_TOPIC");
         keyValue.put(ConnectorConfig.TRANSFORMS, "testTransform");
         keyValue.put("transforms-testTransform-class", "org.apache.rocketmq.connect.runtime.connectorwrapper.TestTransform");
         transformChain = new TransformChain<>(keyValue, plugin);
-        workerSourceTask = new WorkerSourceTask(connectConfig, connectorTaskId, sourceTask, this.getClass().getClassLoader(),
+        workerSourceTask = new WorkerSourceTask(workerConfig, connectorTaskId, sourceTask, this.getClass().getClassLoader(),
                 connectKeyValue, positionManagementService, recordConverter, recordConverter, defaultMQProducer, workerState,
                 connectStatsManager, connectStatsService, transformChain, retryWithToleranceOperator, null, new ConnectMetrics(new WorkerConfig()));
         nameServerMocker = NameServerMocker.startByDefaultConf(9876, 10911);
         brokerMocker = ServerResponseMocker.startServer(10911, "Hello World".getBytes(StandardCharsets.UTF_8));
+
+        connectMetrics = new ConnectMetrics(workerConfig);
+        sourceTaskMetricsGroup = new WorkerSourceTask.SourceTaskMetricsGroup(connectorTaskId, connectMetrics);
+        calcSourceRecordWrite = new WorkerSourceTask.CalcSourceRecordWrite(100, sourceTaskMetricsGroup);
+
+        workerSourceTask.doInitializeAndStart();
+
+        Runnable runnable = () -> workerSourceTask.execute();
+        executorService.submit(runnable);
     }
 
     @After
     public void after() {
         executorService.shutdown();
+        workerSourceTask.close();
         nameServerMocker.shutdown();
         brokerMocker.shutdown();
     }
 
     @Test
-    public void runTest() throws InterruptedException {
-        Assertions.assertThatCode(() -> executorService.submit(() -> workerSourceTask.run())).doesNotThrowAnyException();
-        TimeUnit.SECONDS.sleep(5);
-        workerSourceTask.close();
+    public void removeMetricsTest() {
+        Assertions.assertThatCode(() -> workerSourceTask.removeMetrics()).doesNotThrowAnyException();
     }
+
+    @Test
+    public void updateCommittableOffsetsTest() {
+        Assertions.assertThatCode(() ->  workerSourceTask.updateCommittableOffsets()).doesNotThrowAnyException();
+    }
+
+    @Test
+    public void prepareToSendRecordTest() {
+        ConnectRecord connectRecord = new ConnectRecord(this.buildRecordPartition(), this.buildRecordOffset(), System.currentTimeMillis());
+        final Optional<RecordOffsetManagement.SubmittedPosition> position = workerSourceTask.prepareToSendRecord(connectRecord);
+        Assert.assertEquals(this.buildRecordOffset(), position.get().getPosition().getOffset());
+    }
+
+    @Test
+    public void convertTransformedRecordTest() {
+        ConnectRecord connectRecord = new ConnectRecord(this.buildRecordPartition(), this.buildRecordOffset(), System.currentTimeMillis());
+        connectRecord.setData("Hello World");
+        final Schema build = SchemaBuilder.string().build();
+        build.setFields(Lists.newArrayList(new Field(0, "testFiled", build)));
+        connectRecord.setSchema(build);
+        final Message message = workerSourceTask.convertTransformedRecord("testTopic", connectRecord);
+        Assert.assertEquals("testTopic", message.getTopic());
+    }
+
+    @Test
+    public void initializeAndStartTest() {
+        Assertions.assertThatCode(() -> workerSourceTask.initializeAndStart()).doesNotThrowAnyException();
+    }
+
+    @Test
+    public void finalOffsetCommitTest() {
+        Assertions.assertThatCode(() -> workerSourceTask.finalOffsetCommit(true)).doesNotThrowAnyException();
+    }
+
+    @Test
+    public void commitOffsetsTest() {
+        Assertions.assertThatCode(() -> workerSourceTask.commitOffsets()).doesNotThrowAnyException();
+    }
+
+    @Test
+    public void commitSourceTaskTest() {
+        Assertions.assertThatCode(() -> workerSourceTask.commitSourceTask()).doesNotThrowAnyException();
+    }
+
+    @Test
+    public void recordPollReturnedTest() {
+        Assertions.assertThatCode(() -> workerSourceTask.recordPollReturned(10, 1000)).doesNotThrowAnyException();
+    }
+
+
+    private RecordPartition buildRecordPartition() {
+        Map<String, String> partition = new HashMap<>();
+        partition.put("defaultPartition", "defaultPartition");
+        RecordPartition recordPartition = new RecordPartition(partition);
+        return recordPartition;
+    }
+
+    private RecordOffset buildRecordOffset() {
+        Map<String, Long> offset = new HashMap<>();
+        offset.put("defaultOffset", 1L);
+        RecordOffset recordOffset = new RecordOffset(offset);
+        return recordOffset;
+    }
+
+    @Test
+    public void recordPollTest() {
+        Assertions.assertThatCode(() ->  sourceTaskMetricsGroup.recordPoll(100, 1000)).doesNotThrowAnyException();
+    }
+
+    @Test
+    public void recordWriteTest() {
+        Assertions.assertThatCode(() ->  sourceTaskMetricsGroup.recordWrite(100)).doesNotThrowAnyException();
+    }
+
+    @Test
+    public void skipRecordTest() {
+        Assertions.assertThatCode(() ->  calcSourceRecordWrite.skipRecord()).doesNotThrowAnyException();
+    }
+
+    @Test
+    public void completeRecordTest(){
+        Assertions.assertThatCode(() ->  calcSourceRecordWrite.completeRecord()).doesNotThrowAnyException();
+    }
+
+    @Test
+    public void retryRemainingTest() {
+        Assertions.assertThatCode(() ->  calcSourceRecordWrite.retryRemaining()).doesNotThrowAnyException();
+    }
+
+
 }

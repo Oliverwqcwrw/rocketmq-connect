@@ -43,6 +43,8 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import org.apache.rocketmq.common.protocol.header.GetConsumerListByGroupResponseBody;
+import org.apache.rocketmq.common.protocol.header.GetMaxOffsetResponseHeader;
+import org.apache.rocketmq.common.protocol.header.SearchOffsetResponseHeader;
 import org.apache.rocketmq.common.protocol.route.BrokerData;
 import java.util.concurrent.ConcurrentHashMap;
 import org.apache.rocketmq.common.protocol.body.SubscriptionGroupWrapper;
@@ -146,7 +148,7 @@ public abstract class ServerResponseMocker {
 
     @ChannelHandler.Sharable
     private class NettyServerHandler extends SimpleChannelInboundHandler<RemotingCommand> {
-        private HashMap<String, String> extMap;
+        private HashMap<String, String> extMap = new HashMap<>();
 
         public NettyServerHandler(HashMap<String, String> extMap) {
             this.extMap = extMap;
@@ -183,6 +185,24 @@ public abstract class ServerResponseMocker {
                     GetConsumerListByGroupResponseBody getConsumerListByGroupResponseBody = new GetConsumerListByGroupResponseBody();
                     getConsumerListByGroupResponseBody.setConsumerIdList(Collections.singletonList("mockConsumer1"));
                     response.setBody(JSON.toJSONBytes(getConsumerListByGroupResponseBody));
+                    break;
+                }
+
+                case RequestCode.SEARCH_OFFSET_BY_TIMESTAMP: {
+                    SearchOffsetResponseHeader responseHeader = new SearchOffsetResponseHeader();
+                    responseHeader.setOffset(1L);
+                    response.setBody(JSON.toJSONBytes(responseHeader));
+                    break;
+                }
+
+                case RequestCode.GET_MAX_OFFSET: {
+                    GetMaxOffsetResponseHeader responseHeader = new GetMaxOffsetResponseHeader();
+                    responseHeader.setOffset(1L);
+                    response.setBody(JSON.toJSONBytes(responseHeader));
+                    if (extMap == null) {
+                        extMap = new HashMap<>();
+                    }
+                    extMap.put("offset", "1");
                     break;
                 }
                 default:
